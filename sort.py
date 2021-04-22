@@ -25,9 +25,33 @@ import glob
 import time
 import argparse
 from filterpy.kalman import KalmanFilter
+from shapely.affinity import rotate as Rotate
+from shapely.geometry import Polygon
 
 np.random.seed(0)
 
+# rotated boxes based on
+# https://github.com/kiselev1189/SORT-R/blob/master/sort.py
+
+def rotate_bbox(x,y,w,h,angle):
+    angle = np.radians(angle)
+    c, s = np.cos(angle), np.sin(angle)
+    R = np.asarray([[c, s], [-s, c]])
+    pts = np.asarray([[-w/2, -h/2], [w/2, -h/2], [w/2, h/2], [-w/2, h/2]])
+    rot_pts = []
+    for pt in pts:
+        rot_pts.append(([x, y] + pt @ R).astype(int))
+
+    return rot_pts
+
+def get_polygon_from_rotated(bbox):
+    rot_pts = np.array(np.array(rotate_bbox(*bbox[:5])))
+    contours = np.array(
+        [rot_pts[0],
+        rot_pts[1],
+        rot_pts[2],
+        rot_pts[3]])
+    return Polygon(np.array(contours, dtype=np.int32).reshape(-1, 2))
 
 def linear_assignment(cost_matrix):
     try:
@@ -39,6 +63,10 @@ def linear_assignment(cost_matrix):
         x, y = linear_sum_assignment(cost_matrix)
         return np.array(list(zip(x, y)))
 
+def iou_rotated(bb_test, bb_gt):
+    p1 = get_polygon_from_rotated(bb_test[:6])
+    p2 = get_polygon_from_rotated(bb_gt)
+    return p1.intersection(p2).area / p1.union(p2).area
 
 def iou_batch(bb_test, bb_gt):
     """
@@ -57,7 +85,7 @@ def iou_batch(bb_test, bb_gt):
     o = wh / ((bb_test[..., 2] - bb_test[..., 0]) * (bb_test[..., 3]
     - bb_test[..., 1]) + (bb_gt[..., 2] - bb_gt[..., 0]) * (bb_gt[..., 3]
     - bb_gt[..., 1]) - wh)  # nopep8
-    return(o)
+    return o
 
 
 def convert_bbox_to_z(bbox):
@@ -66,28 +94,73 @@ def convert_bbox_to_z(bbox):
       [x,y,s,r] where x,y is the centre of the box and s is the scale/area and r is
       the aspect ratio
     """
-    w = bbox[2] - bbox[0]
-    h = bbox[3] - bbox[1]
-    x = bbox[0] + w / 2.
-    y = bbox[1] + h / 2.
-    s = w * h  # scale is just area
-    r = w / float(h)
-    return np.array([x, y, s, r]).reshape((4, 1))
+
+    if len(bbox) == 5:
+        w = bbox[2] - bbox[0]
+        h = bbox[3] - bbox[1]
+        x = bbox[0] + w / 2.
+        y = bbox[1] + h / 2.
+        s = w * h  # scale is just area
+        r = w / float(h)
+        return np.array([x, y, s, r]).reshape((4, 1))
+    elif len(bbox) == 6:
+        poly_bbox = get_polygon_from_rotated(bbox[:5])
+        #poly_bbox = Polygon(bbox)
+
+        # bbox center
+        center_x = bbox[0]
+        center_y = bbox[1]
+
+        # area
+        area = poly_bbox.area
+
+        # aspect ratio
+        x0, y0 = poly_bbox.exterior.coords[0]
+        x1, y1 = poly_bbox.exterior.coords[1]
+        h = np.hypot(x1 - x0, y1 - y0)
+
+        x2, y2 = poly_bbox.exterior.coords[2]
+        w = np.hypot(x2 - x1, y2 - y1)
+
+        aspect_ratio = w / h
+
+        # angle
+        x1 = x1 - x0
+        y1 = y1 - y0
+        vecnorm = np.sqrt(x1 ** 2 + y1 ** 2)
+        x1 = x1 / vecnorm
+        y1 = y1 / vecnorm
+        cos_angle = x1 + y1
+        angle = np.arccos(cos_angle)
+        return np.array([center_x, center_y, area, aspect_ratio, angle]).reshape((5, 1))
 
 
-def convert_x_to_bbox(x, score=None):
+def convert_z_to_bbox(x, score=None):
     """
     Takes a bounding box in the centre form [x,y,s,r] and returns it in the form
       [x1,y1,x2,y2] where x1,y1 is the top left and x2,y2 is the bottom right
     """
-    w = np.sqrt(x[2] * x[3])
-    h = x[2] / w
-    if(score is None):
-        return np.array([x[0] - w / 2., x[1] - h / 2.,
-                         x[0] + w / 2., x[1] + h / 2.]).reshape((1, 4))
-    else:
-        return np.array([x[0] - w / 2., x[1] - h / 2.,
-                         x[0] + w / 2., x[1] + h / 2., score]).reshape((1, 5))
+
+    if len(x) == 7:
+        w = np.sqrt(x[2] * x[3])
+        h = x[2] / w
+        if(score is None):
+            return np.array([x[0] - w / 2., x[1] - h / 2.,
+                            x[0] + w / 2., x[1] + h / 2.]).reshape((1, 4))
+        else:
+            return np.array([x[0] - w / 2., x[1] - h / 2.,
+                            x[0] + w / 2., x[1] + h / 2., score]).reshape((1, 5))
+    elif len(x) == 8: # rotated
+        w = np.sqrt(x[2] * x[3])
+        h = x[2] / w
+
+        if(score is None):
+            bbox =  np.array([x[0], x[1], w, h, x[4]]).reshape((1, 5))
+        else:
+            bbox =  np.array([x[0], x[1], w, h, x[4], score]).reshape((1, 6))
+
+        return bbox
+
 
 
 class KalmanBoxTracker(object):
@@ -101,28 +174,55 @@ class KalmanBoxTracker(object):
         Initialises a tracker using initial bounding box.
         """
         # define constant velocity model
-        self.kf = KalmanFilter(dim_x=7, dim_z=4)
-        self.kf.F = np.array(
-            [[1, 0, 0, 0, 1, 0, 0],
-             [0, 1, 0, 0, 0, 1, 0],
-             [0, 0, 1, 0, 0, 0, 1],
-             [0, 0, 0, 1, 0, 0, 0],
-             [0, 0, 0, 0, 1, 0, 0],
-             [0, 0, 0, 0, 0, 1, 0],
-             [0, 0, 0, 0, 0, 0, 1]])
-        self.kf.H = np.array(
-            [[1, 0, 0, 0, 0, 0, 0],
-             [0, 1, 0, 0, 0, 0, 0],
-             [0, 0, 1, 0, 0, 0, 0],
-             [0, 0, 0, 1, 0, 0, 0]])
+        if len(bbox) == 5:
+            self.kf = KalmanFilter(dim_x=7, dim_z=4)
+            self.kf.F = np.array(
+                [[1, 0, 0, 0, 1, 0, 0],
+                [0, 1, 0, 0, 0, 1, 0],
+                [0, 0, 1, 0, 0, 0, 1],
+                [0, 0, 0, 1, 0, 0, 0],
+                [0, 0, 0, 0, 1, 0, 0],
+                [0, 0, 0, 0, 0, 1, 0],
+                [0, 0, 0, 0, 0, 0, 1]])
+            self.kf.H = np.array(
+                [[1, 0, 0, 0, 0, 0, 0],
+                [0, 1, 0, 0, 0, 0, 0],
+                [0, 0, 1, 0, 0, 0, 0],
+                [0, 0, 0, 1, 0, 0, 0]])
 
-        self.kf.R[2:, 2:] *= 10.
-        self.kf.P[4:, 4:] *= 1000.  # give high uncertainty to the unobservable initial velocities
-        self.kf.P *= 10.
-        self.kf.Q[-1, -1] *= 0.01
-        self.kf.Q[4:, 4:] *= 0.01
+            self.kf.R[2:, 2:] *= 10.
+            self.kf.P[4:, 4:] *= 1000.  # give high uncertainty to the unobservable initial velocities
+            self.kf.P *= 10.
+            self.kf.Q[-1, -1] *= 0.01
+            self.kf.Q[4:, 4:] *= 0.01
 
-        self.kf.x[:4] = convert_bbox_to_z(bbox)
+            self.kf.x[:4] = convert_bbox_to_z(bbox)
+        elif len(bbox) == 6:
+            self.kf = KalmanFilter(dim_x=8, dim_z=5)
+            self.kf.F = np.array([[1, 0, 0, 0, 1, 0, 0, 0],
+                              [0, 1, 0, 0, 0, 1, 0, 0],
+                              [0, 0, 1, 0, 0, 0, 1, 0],
+                              [0, 0, 0, 1, 0, 0, 0, 1],
+                              [0, 0, 0, 0, 1, 0, 0, 0],
+                              [0, 0, 0, 0, 0, 1, 0, 0],
+                              [0, 0, 0, 0, 0, 0, 1, 0],
+                              [0, 0, 0, 0, 0, 0, 0, 1]])
+
+            self.kf.H = np.array(
+                [[1, 0, 0, 0, 0, 0, 0, 0],
+                [0, 1, 0, 0, 0, 0, 0, 0],
+                [0, 0, 1, 0, 0, 0, 0, 0],
+                [0, 0, 0, 1, 0, 0, 0, 0],
+                [0, 0, 0, 0, 1, 0, 0, 0]])
+
+            self.kf.R[2:, 2:] *= 10.
+            self.kf.P[5:, 5:] *= 1000.  # give high uncertainty to the unobservable initial velocities
+            self.kf.P *= 10.
+            self.kf.Q[-1, -1] *= 0.01
+            self.kf.Q[5:, 5:] *= 0.01
+
+            self.kf.x[:5] = convert_bbox_to_z(bbox)
+
         self.time_since_update = 0
         self.id = KalmanBoxTracker.count
         KalmanBoxTracker.count += 1
@@ -154,17 +254,17 @@ class KalmanBoxTracker(object):
         if(self.time_since_update > 0):
             self.hit_streak = 0
         self.time_since_update += 1
-        self.history.append(convert_x_to_bbox(self.kf.x))
+        self.history.append(convert_z_to_bbox(self.kf.x))
         return self.history[-1]
 
     def get_state(self):
         """
         Returns the current bounding box estimate.
         """
-        return convert_x_to_bbox(self.kf.x)
+        return convert_z_to_bbox(self.kf.x)
 
 
-def associate_detections_to_trackers(detections, trackers, iou_threshold=0.3):
+def associate_detections_to_trackers(detections, trackers, iou_threshold=0.3, rotated_boxes=False):
     """
     Assigns detections to tracked object (both represented as bounding boxes)
 
@@ -178,16 +278,23 @@ def associate_detections_to_trackers(detections, trackers, iou_threshold=0.3):
             (0, 5),
             dtype=int)
 
-    iou_matrix = iou_batch(detections, trackers)
-
-    if min(iou_matrix.shape) > 0:
-        a = (iou_matrix > iou_threshold).astype(np.int32)
-        if a.sum(1).max() == 1 and a.sum(0).max() == 1:
-            matched_indices = np.stack(np.where(a), axis=1)
-        else:
-            matched_indices = linear_assignment(-iou_matrix)
+    if rotated_boxes:
+        iou_matrix = np.zeros((len(detections), len(trackers)), dtype=np.float32)
+        for d, det in enumerate(detections):
+            for t, trk in enumerate(trackers):
+                iou_matrix[d, t] = iou_rotated(det, trk)
+        matched_indices = linear_assignment(-iou_matrix)
     else:
-        matched_indices = np.empty(shape=(0, 2))
+        iou_matrix = iou_batch(detections, trackers)
+
+        if min(iou_matrix.shape) > 0:
+            a = (iou_matrix > iou_threshold).astype(np.int32)
+            if a.sum(1).max() == 1 and a.sum(0).max() == 1:
+                matched_indices = np.stack(np.where(a), axis=1)
+            else:
+                matched_indices = linear_assignment(-iou_matrix)
+        else:
+            matched_indices = np.empty(shape=(0, 2))
 
     unmatched_detections = []
     for d, det in enumerate(detections):
@@ -216,7 +323,7 @@ def associate_detections_to_trackers(detections, trackers, iou_threshold=0.3):
 
 
 class Sort(object):
-    def __init__(self, max_age=1, min_hits=3, iou_threshold=0.3):
+    def __init__(self, max_age=1, min_hits=3, iou_threshold=0.3, rotated_boxes=False):
         """
         Sets key parameters for SORT
         """
@@ -225,6 +332,7 @@ class Sort(object):
         self.iou_threshold = iou_threshold
         self.trackers = []
         self.frame_count = 0
+        self.rotated_boxes = rotated_boxes
 
     def update(self, dets=np.empty((0, 6))):
         """
@@ -240,7 +348,11 @@ class Sort(object):
         trks = np.zeros((len(self.trackers), 5))
         to_del = []
         ret = []
-        dets, source_ids = dets[:, :5], dets[:, 5:]
+        if self.rotated_boxes:
+            dets, source_ids = dets[:, :6], dets[:, 6:]
+        else:
+            dets, source_ids = dets[:, :5], dets[:, 5:]
+
         for t, trk in enumerate(trks):
             pos = self.trackers[t].predict()[0]
             trk[:] = [pos[0], pos[1], pos[2], pos[3], 0]
@@ -250,7 +362,7 @@ class Sort(object):
         for t in reversed(to_del):
             self.trackers.pop(t)
         matched, unmatched_dets, unmatched_trks = associate_detections_to_trackers(
-            dets, trks, self.iou_threshold)
+            dets, trks, self.iou_threshold, self.rotated_boxes)
 
         # update matched trackers with assigned detections
         for m in matched:
