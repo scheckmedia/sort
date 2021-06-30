@@ -33,25 +33,32 @@ np.random.seed(0)
 # rotated boxes based on
 # https://github.com/kiselev1189/SORT-R/blob/master/sort.py
 
-def rotate_bbox(x,y,w,h,angle):
+
+def rotate_bbox(x, y, w, h, angle):
     angle = np.radians(angle)
     c, s = np.cos(angle), np.sin(angle)
     R = np.asarray([[c, s], [-s, c]])
-    pts = np.asarray([[-w/2, -h/2], [w/2, -h/2], [w/2, h/2], [-w/2, h/2]])
+    pts = np.asarray(
+        [[-w / 2, -h / 2],
+         [w / 2, -h / 2],
+         [w / 2, h / 2],
+         [-w / 2, h / 2]])
     rot_pts = []
     for pt in pts:
         rot_pts.append(([x, y] + pt @ R).astype(int))
 
     return rot_pts
 
+
 def get_polygon_from_rotated(bbox):
     rot_pts = np.array(np.array(rotate_bbox(*bbox[:5])))
     contours = np.array(
         [rot_pts[0],
-        rot_pts[1],
-        rot_pts[2],
-        rot_pts[3]])
+         rot_pts[1],
+         rot_pts[2],
+         rot_pts[3]])
     return Polygon(np.array(contours, dtype=np.int32).reshape(-1, 2))
+
 
 def linear_assignment(cost_matrix):
     try:
@@ -63,10 +70,12 @@ def linear_assignment(cost_matrix):
         x, y = linear_sum_assignment(cost_matrix)
         return np.array(list(zip(x, y)))
 
+
 def iou_rotated(bb_test, bb_gt):
     p1 = get_polygon_from_rotated(bb_test[:6])
     p2 = get_polygon_from_rotated(bb_gt)
     return p1.intersection(p2).area / p1.union(p2).area
+
 
 def iou_batch(bb_test, bb_gt):
     """
@@ -93,6 +102,8 @@ def convert_bbox_to_z(bbox):
     Takes a bounding box in the form [x1,y1,x2,y2] and returns z in the form
       [x,y,s,r] where x,y is the centre of the box and s is the scale/area and r is
       the aspect ratio
+      for rotated [cx,cy,w,h,a] --> [cx,cy,s,r,a]
+      a is the angle
     """
 
     if len(bbox) == 5:
@@ -104,35 +115,11 @@ def convert_bbox_to_z(bbox):
         r = w / float(h)
         return np.array([x, y, s, r]).reshape((4, 1))
     elif len(bbox) == 6:
-        poly_bbox = get_polygon_from_rotated(bbox[:5])
-        #poly_bbox = Polygon(bbox)
-
-        # bbox center
-        center_x = bbox[0]
-        center_y = bbox[1]
-
-        # area
-        area = poly_bbox.area
-
-        # aspect ratio
-        x0, y0 = poly_bbox.exterior.coords[0]
-        x1, y1 = poly_bbox.exterior.coords[1]
-        h = np.hypot(x1 - x0, y1 - y0)
-
-        x2, y2 = poly_bbox.exterior.coords[2]
-        w = np.hypot(x2 - x1, y2 - y1)
-
-        aspect_ratio = w / h
-
-        # angle
-        x1 = x1 - x0
-        y1 = y1 - y0
-        vecnorm = np.sqrt(x1 ** 2 + y1 ** 2)
-        x1 = x1 / vecnorm
-        y1 = y1 / vecnorm
-        cos_angle = x1 + y1
-        angle = np.arccos(cos_angle)
-        return np.array([center_x, center_y, area, aspect_ratio, angle]).reshape((5, 1))
+        #poly_bbox = get_polygon_from_rotated(bbox[:5])
+        cx, cy, w, h, a = bbox[:5]
+        aspect = w / h
+        area = w * h
+        return np.array([cx, cy, area, aspect, a]).reshape((5, 1))
 
 
 def convert_z_to_bbox(x, score=None):
@@ -146,21 +133,22 @@ def convert_z_to_bbox(x, score=None):
         h = x[2] / w
         if(score is None):
             return np.array([x[0] - w / 2., x[1] - h / 2.,
-                            x[0] + w / 2., x[1] + h / 2.]).reshape((1, 4))
+                             x[0] + w / 2., x[1] + h / 2.]).reshape((1, 4))
         else:
-            return np.array([x[0] - w / 2., x[1] - h / 2.,
-                            x[0] + w / 2., x[1] + h / 2., score]).reshape((1, 5))
-    elif len(x) == 8: # rotated
+            return np.array(
+                [x[0] - w / 2., x[1] - h / 2., x[0] + w / 2., x[1] + h / 2.,
+                 score]).reshape(
+                (1, 5))
+    elif len(x) == 8:  # rotated
         w = np.sqrt(x[2] * x[3])
         h = x[2] / w
 
         if(score is None):
-            bbox =  np.array([x[0], x[1], w, h, x[4]]).reshape((1, 5))
+            bbox = np.array([x[0], x[1], w, h, x[4]]).reshape((1, 5))
         else:
-            bbox =  np.array([x[0], x[1], w, h, x[4], score]).reshape((1, 6))
+            bbox = np.array([x[0], x[1], w, h, x[4], score]).reshape((1, 6))
 
         return bbox
-
 
 
 class KalmanBoxTracker(object):
@@ -178,17 +166,17 @@ class KalmanBoxTracker(object):
             self.kf = KalmanFilter(dim_x=7, dim_z=4)
             self.kf.F = np.array(
                 [[1, 0, 0, 0, 1, 0, 0],
-                [0, 1, 0, 0, 0, 1, 0],
-                [0, 0, 1, 0, 0, 0, 1],
-                [0, 0, 0, 1, 0, 0, 0],
-                [0, 0, 0, 0, 1, 0, 0],
-                [0, 0, 0, 0, 0, 1, 0],
-                [0, 0, 0, 0, 0, 0, 1]])
+                 [0, 1, 0, 0, 0, 1, 0],
+                 [0, 0, 1, 0, 0, 0, 1],
+                 [0, 0, 0, 1, 0, 0, 0],
+                 [0, 0, 0, 0, 1, 0, 0],
+                 [0, 0, 0, 0, 0, 1, 0],
+                 [0, 0, 0, 0, 0, 0, 1]])
             self.kf.H = np.array(
                 [[1, 0, 0, 0, 0, 0, 0],
-                [0, 1, 0, 0, 0, 0, 0],
-                [0, 0, 1, 0, 0, 0, 0],
-                [0, 0, 0, 1, 0, 0, 0]])
+                 [0, 1, 0, 0, 0, 0, 0],
+                 [0, 0, 1, 0, 0, 0, 0],
+                 [0, 0, 0, 1, 0, 0, 0]])
 
             self.kf.R[2:, 2:] *= 10.
             self.kf.P[4:, 4:] *= 1000.  # give high uncertainty to the unobservable initial velocities
@@ -200,20 +188,20 @@ class KalmanBoxTracker(object):
         elif len(bbox) == 6:
             self.kf = KalmanFilter(dim_x=8, dim_z=5)
             self.kf.F = np.array([[1, 0, 0, 0, 1, 0, 0, 0],
-                              [0, 1, 0, 0, 0, 1, 0, 0],
-                              [0, 0, 1, 0, 0, 0, 1, 0],
-                              [0, 0, 0, 1, 0, 0, 0, 1],
-                              [0, 0, 0, 0, 1, 0, 0, 0],
-                              [0, 0, 0, 0, 0, 1, 0, 0],
-                              [0, 0, 0, 0, 0, 0, 1, 0],
-                              [0, 0, 0, 0, 0, 0, 0, 1]])
+                                  [0, 1, 0, 0, 0, 1, 0, 0],
+                                  [0, 0, 1, 0, 0, 0, 1, 0],
+                                  [0, 0, 0, 1, 0, 0, 0, 1],
+                                  [0, 0, 0, 0, 1, 0, 0, 0],
+                                  [0, 0, 0, 0, 0, 1, 0, 0],
+                                  [0, 0, 0, 0, 0, 0, 1, 0],
+                                  [0, 0, 0, 0, 0, 0, 0, 1]])
 
             self.kf.H = np.array(
                 [[1, 0, 0, 0, 0, 0, 0, 0],
-                [0, 1, 0, 0, 0, 0, 0, 0],
-                [0, 0, 1, 0, 0, 0, 0, 0],
-                [0, 0, 0, 1, 0, 0, 0, 0],
-                [0, 0, 0, 0, 1, 0, 0, 0]])
+                 [0, 1, 0, 0, 0, 0, 0, 0],
+                 [0, 0, 1, 0, 0, 0, 0, 0],
+                 [0, 0, 0, 1, 0, 0, 0, 0],
+                 [0, 0, 0, 0, 1, 0, 0, 0]])
 
             self.kf.R[2:, 2:] *= 10.
             self.kf.P[5:, 5:] *= 1000.  # give high uncertainty to the unobservable initial velocities
@@ -264,7 +252,8 @@ class KalmanBoxTracker(object):
         return convert_z_to_bbox(self.kf.x)
 
 
-def associate_detections_to_trackers(detections, trackers, iou_threshold=0.3, rotated_boxes=False):
+def associate_detections_to_trackers(
+        detections, trackers, iou_threshold=0.3, rotated_boxes=False):
     """
     Assigns detections to tracked object (both represented as bounding boxes)
 
@@ -279,7 +268,10 @@ def associate_detections_to_trackers(detections, trackers, iou_threshold=0.3, ro
             dtype=int)
 
     if rotated_boxes:
-        iou_matrix = np.zeros((len(detections), len(trackers)), dtype=np.float32)
+        iou_matrix = np.zeros(
+            (len(detections),
+             len(trackers)),
+            dtype=np.float32)
         for d, det in enumerate(detections):
             for t, trk in enumerate(trackers):
                 iou_matrix[d, t] = iou_rotated(det, trk)
@@ -322,7 +314,9 @@ def associate_detections_to_trackers(detections, trackers, iou_threshold=0.3, ro
 
 
 class Sort(object):
-    def __init__(self, max_age=1, min_hits=3, iou_threshold=0.3, rotated_boxes=False):
+    def __init__(
+            self, max_age=1, min_hits=3, iou_threshold=0.3,
+            rotated_boxes=False):
         """
         Sets key parameters for SORT
         """
